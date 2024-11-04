@@ -2144,7 +2144,7 @@ class BERTopic:
         documents.Topic = documents.Topic.map(mapping)
         self.topic_mapper_.add_mappings(mapping, topic_model=self)
         documents = self._sort_mappings_by_frequency(documents)
-        self._extract_topics(documents, mappings=mappings)
+        self._extract_topics(documents, mappings=mappings, verbose=self.verbose)
         self._update_topic_size(documents)
         self._save_representative_docs(documents)
         self.probabilities_ = self._map_probabilities(self.probabilities_)
@@ -3986,11 +3986,6 @@ class BERTopic:
         Returns:
             c_tf_idf: The resulting matrix giving a value (importance score) for each word per topic
         """
-        if verbose:
-            action = "Fine-tuning" if fine_tune_representation else "Extracting"
-            method = "representation models" if fine_tune_representation else "c-TF-IDF for topic reduction"
-            logger.info(f"Representation - {action} topics using {method}.")
-
         documents_per_topic = documents.groupby(["Topic"], as_index=False).agg({"Document": " ".join})
         self.c_tf_idf_, words = self._c_tf_idf(documents_per_topic)
         self.topic_representations_ = self._extract_words_per_topic(
@@ -4204,8 +4199,14 @@ class BERTopic:
             tf_idf: The resulting matrix giving a value (importance score) for each word per topic
             words: The names of the words to which values were given
         """
-        documents = self._preprocess_text(documents_per_topic.Document.values)
+        if self.verbose:
+            action = "Calculating" if self.ctfidf_model is None else "Updating"
+            logger.info(f"Bag of Words - {action} Bag of Words for each topic")
 
+        # Tokenize the documents
+        documents = self._preprocess_text(documents_per_topic.Document.values)
+        if self.verbose:
+            logger.info("Bag of Words - Tokenization using vectorizer")
         if partial_fit:
             X = self.vectorizer_model.partial_fit(documents).update_bow(documents)
         elif fit:
@@ -4220,21 +4221,27 @@ class BERTopic:
         else:
             words = self.vectorizer_model.get_feature_names()
 
+        # Setting the multiplier for the c-TF-IDF
         multiplier = None
         if self.ctfidf_model.seed_words and self.seed_topic_list:
+            logger.info("Bag of Words - Setting multiplier for c-TF-IDF using seed words and seed topic list")
             seed_topic_list = [seed for seeds in self.seed_topic_list for seed in seeds]
             multiplier = np.array(
                 [self.ctfidf_model.seed_multiplier if word in self.ctfidf_model.seed_words else 1 for word in words]
             )
             multiplier = np.array([1.2 if word in seed_topic_list else value for value, word in zip(multiplier, words)])
         elif self.ctfidf_model.seed_words:
+            logger.info("Bag of Words - Setting multiplier for c-TF-IDF using seed words")
             multiplier = np.array(
                 [self.ctfidf_model.seed_multiplier if word in self.ctfidf_model.seed_words else 1 for word in words]
             )
         elif self.seed_topic_list:
+            logger.info("Bag of Words - Setting multiplier for c-TF-IDF using seed topic list")
             seed_topic_list = [seed for seeds in self.seed_topic_list for seed in seeds]
             multiplier = np.array([1.2 if word in seed_topic_list else 1 for word in words])
 
+        # Calculate the c-TF-IDF matrix
+        logger.info("Bag of Words - Calculating c-TF-IDF matrix")
         if fit:
             self.ctfidf_model = self.ctfidf_model.fit(X, multiplier=multiplier)
 
@@ -4304,14 +4311,18 @@ class BERTopic:
         topics = base_topics.copy()
         if not self.representation_model or not fine_tune_representation:
             # Default representation: c_tf_idf + top_n_words
+            logger.info("Representation - Extracting top words from c_tf_idf")
             topics = {label: values[: self.top_n_words] for label, values in topics.items()}
         elif fine_tune_representation and isinstance(self.representation_model, list):
+            logger.info("Representation - Fine-tuning topics using representation model")
             for tuner in self.representation_model:
                 topics = tuner.extract_topics(self, documents, c_tf_idf, topics)
         elif fine_tune_representation and isinstance(self.representation_model, BaseRepresentation):
+            logger.info("Representation - Fine-tuning topics using representation model")
             topics = self.representation_model.extract_topics(self, documents, c_tf_idf, topics)
         elif fine_tune_representation and isinstance(self.representation_model, dict):
             if self.representation_model.get("Main"):
+                logger.info("Representation - Fine-tuning topics using main representation model")
                 main_model = self.representation_model["Main"]
                 if isinstance(main_model, BaseRepresentation):
                     topics = main_model.extract_topics(self, documents, c_tf_idf, topics)
@@ -4322,12 +4333,16 @@ class BERTopic:
                     raise TypeError(f"unsupported type {type(main_model).__name__} for representation_model['Main']")
             else:
                 # Default representation: c_tf_idf + top_n_words
+                logger.info("Representation - No representation_model['Main'] found")
+                logger.info("Representation - Extracting top words from c_tf_idf")
                 topics = {label: values[: self.top_n_words] for label, values in topics.items()}
         else:
             raise TypeError(f"unsupported type {type(self.representation_model).__name__} for representation_model")
 
         # Extract additional topic aspects
         if calculate_aspects and isinstance(self.representation_model, dict):
+            if any(key != "main" for key in self.representation_model.keys()):
+                logger.info("Representation - Extracting additional topic aspects")
             for aspect, aspect_model in self.representation_model.items():
                 if aspect != "Main":
                     aspects = base_topics.copy()
@@ -4375,9 +4390,6 @@ class BERTopic:
         else:
             raise ValueError("nr_topics needs to be an int or 'auto'! ")
 
-        logger.info(
-            f"Topic reduction - Reduced number of topics from {initial_nr_topics} to {len(self.get_topic_freq())}"
-        )
         return documents
 
     def _reduce_to_n_topics(self, documents: pd.DataFrame, use_ctfidf: bool = False) -> pd.DataFrame:
@@ -4411,6 +4423,9 @@ class BERTopic:
             )
         cluster.fit(distance_matrix)
         new_topics = [cluster.labels_[topic] if topic != -1 else -1 for topic in topics]
+
+        initial_nr_topics = len(self.get_topics())
+        logger.info(f"Topic reduction - Reduced number of topics from {initial_nr_topics} to {len(set(new_topics))}")
 
         # Track mappings and sizes of topics for merging topic embeddings
         mapped_topics = {from_topic: to_topic for from_topic, to_topic in zip(topics, new_topics)}
@@ -4452,7 +4467,7 @@ class BERTopic:
         unique_topics = sorted(list(documents.Topic.unique()))[self._outliers :]
         max_topic = unique_topics[-1]
 
-        # Find similar topics
+        # Find similar topics using HDBSCAN
         embeddings = select_topic_representation(
             self.c_tf_idf_, self.topic_embeddings_, use_ctfidf, output_ndarray=True
         )[0]
@@ -4463,6 +4478,11 @@ class BERTopic:
             cluster_selection_method="eom",
             prediction_data=True,
         ).fit_predict(norm_data[self._outliers :])
+
+        initial_nr_topics = len(self.get_topics())
+        logger.info(
+            f"Topic reduction - Auto-reduced number of topics from {initial_nr_topics} to {len(set(predictions))}"
+        )
 
         # Map similar topics
         mapped_topics = {
